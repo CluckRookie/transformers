@@ -89,20 +89,24 @@ class VisionTextDualEncoderConfig(PretrainedConfig):
 
         vision_config = kwargs.pop("vision_config")
         text_config = kwargs.pop("text_config")
-
-        vision_model_type = vision_config.pop("model_type")
-        text_model_type = text_config.pop("model_type")
-
+        if isinstance(vision_config, dict):
+            vision_config = AutoConfig.from_pretrained(vision_config["_name_or_path"], trust_remote_code=True)
+        if isinstance(text_config, dict):
+            text_config = AutoConfig.from_pretrained(text_config["_name_or_path"], trust_remote_code=True)
+        # vision_model_type = vision_config.pop("model_type")
+        # text_model_type = text_config.pop("model_type")
+        vision_model_type = vision_config.model_type
+        text_model_type = text_config.model_type
         vision_config_class = VISION_MODEL_CONFIGS.get(vision_model_type)
         if vision_config_class is not None:
             self.vision_config = vision_config_class(**vision_config)
         else:
-            self.vision_config = AutoConfig.for_model(vision_model_type, **vision_config)
-            if hasattr(self.vision_config, "vision_config"):
-                self.vision_config = self.vision_config.vision_config
+            self.vision_config = vision_config# AutoConfig.for_model(vision_model_type, **vision_config)
+            # if hasattr(self.vision_config, "vision_config"):
+            #     self.vision_config = self.vision_config.vision_config
 
-        self.text_config = AutoConfig.for_model(text_model_type, **text_config)
-
+        self.text_config = text_config#AutoConfig.for_model(text_model_type,  **text_config)
+        #self.text_config = AutoConfig.from_pretrained(**text_config)
         self.projection_dim = projection_dim
         self.logit_scale_init_value = logit_scale_init_value
 
@@ -116,4 +120,4 @@ class VisionTextDualEncoderConfig(PretrainedConfig):
             [`VisionTextDualEncoderConfig`]: An instance of a configuration object
         """
 
-        return cls(vision_config=vision_config.to_dict(), text_config=text_config.to_dict(), **kwargs)
+        return cls(vision_config=vision_config, text_config=text_config, **kwargs)

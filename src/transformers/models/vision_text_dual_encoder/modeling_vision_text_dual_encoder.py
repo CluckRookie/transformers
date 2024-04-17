@@ -152,9 +152,9 @@ def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
 
 
 # Copied from transformers.models.clip.modeling_clip.clip_loss
-def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
-    caption_loss = contrastive_loss(similarity)
-    image_loss = contrastive_loss(similarity.t())
+def clip_loss(similarity_text: torch.Tensor, similarity_image: torch.Tensor) -> torch.Tensor:
+    caption_loss = contrastive_loss(similarity_text)
+    image_loss = contrastive_loss(similarity_image)
     return (caption_loss + image_loss) / 2.0
 
 
@@ -171,7 +171,6 @@ class VisionTextDualEncoderModel(PreTrainedModel):
     ):
         if config is None and (vision_model is None or text_model is None):
             raise ValueError("Either a configuration or an vision and a text model has to be provided")
-
         if config is None:
             config = VisionTextDualEncoderConfig.from_vision_text_configs(vision_model.config, text_model.config)
         else:
@@ -180,15 +179,13 @@ class VisionTextDualEncoderModel(PreTrainedModel):
 
         # initialize with config
         super().__init__(config)
-
         if vision_model is None:
             if isinstance(config.vision_config, CLIPVisionConfig):
                 vision_model = CLIPVisionModel(config.vision_config)
             else:
-                vision_model = AutoModel.from_config(config.vision_config)
-
+                vision_model = AutoModel.from_config(config.vision_config, trust_remote_code=True)
         if text_model is None:
-            text_model = AutoModel.from_config(config.text_config)
+            text_model = AutoModel.from_config(config.text_config, trust_remote_code=True)
 
         self.vision_model = vision_model
         self.text_model = text_model
@@ -197,8 +194,10 @@ class VisionTextDualEncoderModel(PreTrainedModel):
         # so that the updates to the config will be synced
         self.vision_model.config = self.config.vision_config
         self.text_model.config = self.config.text_config
-
-        self.vision_embed_dim = config.vision_config.hidden_size
+        if hasattr(config.vision_config, "output_size"):
+            self.vision_embed_dim = config.vision_config.output_size
+        else:
+            self.vision_embed_dim = config.vision_config.hidden_size
         self.text_embed_dim = config.text_config.hidden_size
         self.projection_dim = config.projection_dim
 
@@ -370,25 +369,29 @@ class VisionTextDualEncoderModel(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-
-        image_embeds = vision_outputs[1]  # pooler_output
+        image_embeds = vision_outputs[0]  # pooler_output
         image_embeds = self.visual_projection(image_embeds)
-
-        text_embeds = text_outputs[1]  # pooler_output
+        
+        text_embeds = text_outputs[0]  # pooler_output
         text_embeds = self.text_projection(text_embeds)
 
-        # normalized features
+        logit_scale = self.logit_scale.exp()
+        
         image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
         text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
 
-        # cosine similarity as logits
-        logit_scale = self.logit_scale.exp()
-        logits_per_text = torch.matmul(text_embeds, image_embeds.t()) * logit_scale
-        logits_per_image = logits_per_text.T
+        token_scores_image = torch.einsum('qin,pjn->qipj', image_embeds, text_embeds)*logit_scale
+        token_scores_image = torch.where(attention_mask.unsqueeze(0).unsqueeze(0) == 1, token_scores_image, torch.full_like(token_scores_image, float('-inf')))
+        scores_image, _ = token_scores_image.max(-1)
+        logits_per_image = scores_image.mean(1)
+        token_scores_text = torch.einsum('qin,pjn->qipj', text_embeds, image_embeds)*logit_scale
+        scores_text, _ = token_scores_text.max(-1)
+        scores_text = torch.where(attention_mask.unsqueeze(2) == 1, scores_text, torch.full_like(scores_text, 0))
+        logits_per_text = scores_text.sum(1)/attention_mask.sum(-1, keepdim=True)
 
         loss = None
         if return_loss:
-            loss = clip_loss(logits_per_text)
+            loss = clip_loss(logits_per_text, logits_per_image)
 
         if not return_dict:
             output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)
@@ -493,7 +496,7 @@ class VisionTextDualEncoderModel(PreTrainedModel):
                 )
 
             if "config" not in kwargs_vision:
-                vision_config = AutoConfig.from_pretrained(vision_model_name_or_path)
+                vision_config = AutoConfig.from_pretrained(vision_model_name_or_path, trust_remote_code=True)
 
             if vision_config.model_type == "clip":
                 kwargs_vision["config"] = vision_config.vision_config
@@ -511,14 +514,14 @@ class VisionTextDualEncoderModel(PreTrainedModel):
                 )
 
             if "config" not in kwargs_text:
-                text_config = AutoConfig.from_pretrained(text_model_name_or_path)
+                text_config = AutoConfig.from_pretrained(text_model_name_or_path, trust_remote_code=True)
                 kwargs_text["config"] = text_config
+                
 
             text_model = AutoModel.from_pretrained(text_model_name_or_path, *model_args, **kwargs_text)
 
         # instantiate config with corresponding kwargs
         config = VisionTextDualEncoderConfig.from_vision_text_configs(vision_model.config, text_model.config, **kwargs)
-
         # init model
         model = cls(config=config, vision_model=vision_model, text_model=text_model)
 
